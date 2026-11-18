@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Rantalainen – Hinnantarkastustyökalu</title>
+<link rel="icon" href="data:,">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>tailwind.config = { darkMode: 'class' }</script>
+<style>
+:root{box-sizing:border-box;color-scheme:light dark;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+body{font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+@media print{header,nav,.noprint{display:none!important}}
+</style>
+</head>
+<body class="bg-slate-50 dark:bg-slate-900 text-slate-900 dark:text-slate-100 transition-colors duration-200">
+<div id="app"></div>
+<script>
+// TIETOMALLI (JSON)
+const DATA = {
+  products: [
+    { id: "M-01", name: "Kirjanpito (Perus)", category: "Core", billingType: "Jatkuva", billingUnit: "kk", unitPrice: 250.00, minPrice: 200.00, dependencies: [] },
+    { id: "M-02", name: "Tilinpäätös (Perus)", category: "Core", billingType: "Jatkuva", billingUnit: "kk", unitPrice: 50.00, minPrice: 40.00, dependencies: [] },
+    { id: "M-03", name: "Kirjanpito (Laaja)", category: "Core", billingType: "Jatkuva", billingUnit: "kk", unitPrice: 450.00, minPrice: 380.00, dependencies: [] },
+    { id: "M-04", name: "Palkanlaskenta", category: "Lisäpalvelu", billingType: "Jatkuva", billingUnit: "kpl", unitPrice: 4.50, minPrice: 3.50, dependencies: ["M-01", "M-03"] },
+    { id: "M-05", name: "Ostoreskontra", category: "Lisäpalvelu", billingType: "Jatkuva", billingUnit: "kpl", unitPrice: 0.85, minPrice: 0.70, dependencies: ["M-01", "M-03"] },
+    { id: "M-06", name: "HR-konsultointi", category: "Asiantuntijatyö", billingType: "Kertaluonteinen", billingUnit: "h", unitPrice: 120.00, minPrice: 100.00, dependencies: [] },
+    { id: "M-07", name: "Käyttöönottoprojekti", category: "Asiantuntijatyö", billingType: "Kertaluonteinen", billingUnit: "kpl", unitPrice: 500.00, minPrice: 500.00, dependencies: [] }
+  ],
+  packages: [
+    { id: "P-100", name: "Suppea Core", includedModules: ["M-01"], targetCustomer: "Pienyritys, vähän tositteita" },
+    { id: "P-200", name: "Perus Core", includedModules: ["M-01", "M-02"], targetCustomer: "Kasvava yritys, perus tarpeet" },
+    { id: "P-300", name: "Laaja Core", includedModules: ["M-03", "M-02"], targetCustomer: "Keskisuuri, vaatii laajaa seurantaa" }
+  ],
+  discounts: [
+    { id: "A-01", name: "Keskittäjäalennus (5%)", calculationType: "percentage", value: 5, targetScope: "total" },
+    { id: "A-02", name: "Sopimusasiakas Prosentti (10%)", calculationType: "percentage", value: 10, targetScope: "category:Asiantuntijatyö" },
+    { id: "A-03", name: "Kampanja: Uusi Asiakas (-50€)", calculationType: "fixed", value: 50.00, targetScope: "first_month_invoice" }
+  ]
+};
+
+const prod = id => DATA.products.find(p => p.id === id);
+const pkgOf = id => DATA.packages.find(p => p.id === id);
+const eur = n => n.toLocaleString("fi-FI", { style: "currency", currency: "EUR" });
+const STEPS = ["Tarvekartoitus", "Ydinpalvelu & Lisät", "Lisäpalvelut & Alennukset", "Yhteenveto & Sopimushinta"];
+
+// SOVELLUKSEN TILA (State)
+const S = {
+  view: 'login', // 'login', 'sales', 'admin'
+  role: null,    // 'myyja', 'admin'
+  step: 1,
+  survey: { employees: 5, invoices: 120, locations: 1, reporting: "Laaja", payrollNeeded: true },
+  pkg: "P-200",
+  extras: {},
+  disc: { "A-01": true, "A-02": true },
+  customPrice: null
+};
+
+function toggleTheme() {
+  document.documentElement.classList.toggle('dark');
+  render();
+}
+
+// YHTEISET FUNKTIOT
+function showToast(msg) {
+  const t = document.createElement('div');
+  t.className = 'fixed bottom-5 right-5 bg-red-600 text-white px-5 py-3 rounded-lg shadow-xl z-50 transition-opacity duration-300 flex items-center gap-3 text-sm font-semibold';
+  t.innerHTML = `<span>⚠️</span> <span>${msg}</span>`;
+  document.body.appendChild(t);
+  setTimeout(() => { t.style.opacity = '0'; setTimeout(()=>t.remove(), 300); }, 4000);
+}
+
+function applySurveyToPricing() {
+  const inv = Math.max(0, parseInt(S.survey.invoices) || 0);
+  const emp = Math.max(0, parseInt(S.survey.employees) || 0);
+
+  if (inv <= 100) S.pkg = "P-100";
+  else if (inv <= 500) S.pkg = "P-200";
+  else S.pkg = "P-300";
+
+  if (S.survey.payrollNeeded && emp > 0) {
+    S.extras["M-04"] = { qty: emp };
+  } else {
+    delete S.extras["M-04"];
+  }
+}
+
+function pkgBasePrice(id) {
+  return pkgOf(id).includedModules.reduce((sum, m) => sum + prod(m).unitPrice, 0);
+}
+
+function calc() {
+  const inv = Math.max(0, parseInt(S.survey.invoices) || 0);
+  const loc = Math.max(1, parseInt(S.survey.locations) || 1);
+
+  let complexitySum = 0;
+  const complexityDetails = [];
+
+  if (inv > 100) {
+    const extraBlocks = Math.ceil((inv - 100) / 100);
+    const cost = extraBlocks * 30.00;
+    complexitySum += cost;
+    complexityDetails.push({ name: `Lisätositteet (${inv} kpl, +${extraBlocks}x100 erää)`, price: cost });
+  }
+
+  if (loc > 1) {
+    const cost = (loc - 1) * 40.00;
+    complexitySum += cost;
+    complexityDetails.push({ name: `Lisätoimipaikat (${loc - 1} kpl)`, price: cost });
+  }
+
+  let addonSum = 0;
+  const addonDetails = [];
+  if (S.survey.reporting === "Laaja") {
+    addonSum += 30.00;
+    addonDetails.push({ name: "Laajempi johdon raportointi", price: 30.00 });
+  }
+
+  const pk = pkgOf(S.pkg);
+  const lines = [];
+  
+  pk.includedModules.forEach(mid => {
+    const p = prod(mid);
+    lines.push({ label: p.name, list: p.unitPrice, cat: "Ydinpalvelu", type: p.billingType, origId: p.id, qty: 1, disc: 0 });
+  });
+
+  complexityDetails.forEach(c => lines.push({ label: c.name, list: c.price, cat: "Monimutkaisuus", type: "Jatkuva", qty: 1, disc: 0 }));
+  addonDetails.forEach(a => lines.push({ label: a.name, list: a.price, cat: "Palvelulisä", type: "Jatkuva", qty: 1, disc: 0 }));
+
+  for (const id in S.extras) {
+    const p = prod(id), q = S.extras[id].qty;
+    const hasQty = p.billingUnit !== "kk";
+    lines.push({ label: p.name + (hasQty ? ` (${q} ${p.billingUnit})` : ""), list: p.unitPrice * (hasQty ? q : 1), cat: p.category, type: p.billingType, origId: p.id, qty: hasQty ? q : 1, disc: 0 });
+  }
+
+  const subtotalMonthly = lines.filter(l => l.type === "Jatkuva").reduce((s, l) => s + l.list, 0);
+  const subtotalOnetime = lines.filter(l => l.type === "Kertaluonteinen").reduce((s, l) => s + l.list, 0);
+
+  let a02_monthly = 0, a02_onetime = 0, a01_monthly = 0, a03 = 0;
+
+  if (S.disc["A-02"]) {
+    lines.forEach(l => {
+      if (l.cat === "Asiantuntijatyö") {
+        l.disc = l.list * (DATA.discounts.find(d => d.id === "A-02").value / 100);
+        if (l.type === "Jatkuva") a02_monthly += l.disc;
+        if (l.type === "Kertaluonteinen") a02_onetime += l.disc;
+      }
+    });
+  }
+
+  if (S.disc["A-01"]) {
+    a01_monthly = (subtotalMonthly - a02_monthly) * (DATA.discounts.find(d => d.id === "A-01").value / 100);
+  }
+
+  const monthly = subtotalMonthly - a02_monthly - a01_monthly;
+  const onetime = subtotalOnetime - a02_onetime;
+
+  if (S.disc["A-03"]) {
+    a03 = Math.min(DATA.discounts.find(d => d.id === "A-03").value, monthly);
+  }
+
+  const recommendedMonthly = monthly;
+  const finalMonthly = S.customPrice !== null ? S.customPrice : recommendedMonthly;
+
+  let warnings = [];
+  lines.forEach(l => {
+    if (l.origId) {
+      const p = prod(l.origId);
+      const unitP = (l.list - l.disc) / l.qty;
+      if (unitP < p.minPrice) {
+        warnings.push(`${p.name} yksikköhinta (${eur(unitP)}) alittaa määritetyn katevaroituksen alarajan (${eur(p.minPrice)})`);
+      }
+    }
+  });
+
+  if (S.customPrice !== null && S.customPrice < recommendedMonthly) {
+    const diff = Math.round(((recommendedMonthly - S.customPrice) / recommendedMonthly) * 100);
+    warnings.push(`Sopimushinta alittaa järjestelmän suosituksen ${diff} % (${eur(recommendedMonthly - S.customPrice)} / kk alennus).`);
+  }
+
+  return { lines, subtotalMonthly, subtotalOnetime, a01_monthly, a02_monthly, a02_onetime, a03, monthly, onetime, recommendedMonthly, finalMonthly, warnings };
+}
+
+// KIRJAUTUMISNÄKYMÄ
+function loginView() {
+  return `<div class="min-h-screen flex items-center justify-center bg-slate-100 dark:bg-slate-900 p-4 transition-colors">
+    <div class="bg-white dark:bg-slate-800 p-8 rounded-xl shadow-lg w-full max-w-sm border border-slate-200 dark:border-slate-700">
+      <div class="flex flex-col items-center gap-3 mb-8">
+        <div class="w-14 h-14 rounded-xl bg-[#0284c7] text-white font-bold flex items-center justify-center text-3xl shadow-md">R</div>
+        <div class="font-bold text-xl text-slate-800 dark:text-white tracking-tight">Rantalainen Pricing</div>
+      </div>
+      
+      <form onsubmit="handleLogin(event)" class="space-y-4">
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Käyttäjätunnus</label>
+          <input id="username" class="w-full border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900/50 dark:text-white rounded-md p-2.5 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500" required>
+        </div>
+        <div>
+          <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Salasana</label>
+          <input type="password" id="password" class="w-full border border-slate-300 dark:border-slate-600 bg-slate-50 dark:bg-slate-900/50 dark:text-white rounded-md p-2.5 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500" required>
+        </div>
+        <button type="submit" class="w-full bg-[#0284c7] text-white font-bold py-2.5 rounded-md hover:bg-sky-700 transition-colors mt-2">Kirjaudu sisään</button>
+      </form>
+      
+      <div class="mt-6 p-3 bg-sky-50 dark:bg-sky-900/30 text-sky-800 dark:text-sky-200 text-xs rounded border border-sky-100 dark:border-sky-800/50">
+        <div class="font-bold mb-1">Kokeile prototyyppiä:</div>
+        <div><b>Myyjä:</b> myyja / myyja</div>
+        <div><b>Admin:</b> admin / admin</div>
+      </div>
+    </div>
+  </div>`;
+}
+
+function handleLogin(e) {
+  e.preventDefault();
+  const u = document.getElementById('username').value;
+  const p = document.getElementById('password').value;
+  if (u === 'admin' && p === 'admin') { S.role = 'admin'; S.view = 'sales'; }
+  else if (u === 'myyja' && p === 'myyja') { S.role = 'myyja'; S.view = 'sales'; }
+  else { showToast('Väärä tunnus tai salasana'); return; }
+  render();
+}
+
+// HEADER & NAVIGOINTI
+function header() {
+  if (S.view === 'login') return '';
+  const isDark = document.documentElement.classList.contains('dark');
+  
+  const adminBtn = S.role === 'admin' ? 
+    `<button onclick="S.view = S.view === 'admin' ? 'sales' : 'admin'; render();" class="ml-4 text-xs font-semibold bg-slate-800 dark:bg-slate-700 text-white px-4 py-2 rounded-md hover:bg-slate-700 dark:hover:bg-slate-600 transition-colors shadow-sm">
+       ${S.view === 'admin' ? '← Palaa Myyntinäkymään' : '⚙️ Siirry Admin-ylläpitoon'}
+     </button>` : '';
+
+  const themeBtn = `
+    <button onclick="toggleTheme()" class="ml-4 flex items-center justify-center w-8 h-8 rounded-md bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors shadow-sm" title="Vaihda teema">
+      ${isDark ? '☀️' : '🌙'}
+    </button>
+  `;
+     
+  const nav = S.view === 'sales' ? `<nav class="border-t border-slate-100 dark:border-slate-700"><ol class="max-w-6xl mx-auto px-5 py-3 flex items-center gap-3 overflow-x-auto text-sm">
+  ${STEPS.map((t, i) => {
+    const n = i + 1, done = n < S.step, cur = n === S.step;
+    const badge = done ? `<span class="w-7 h-7 rounded-full bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-400 flex items-center justify-center text-xs">✓</span>`
+      : cur ? `<span class="w-7 h-7 rounded-full bg-[#0284c7] text-white flex items-center justify-center text-xs font-semibold">${n}</span>`
+      : `<span class="w-7 h-7 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-400 flex items-center justify-center text-xs font-semibold">${n}</span>`;
+    return `<li class="flex items-center gap-2 shrink-0">
+      <button onclick="go(${n})" class="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity focus:outline-none">
+        ${badge}
+        <span class="${cur ? "text-[#0284c7] dark:text-sky-400 font-medium" : done ? "text-slate-700 dark:text-slate-300" : "text-slate-600 dark:text-slate-400"} whitespace-nowrap">${t}</span>
+      </button>
+      ${n < 4 ? `<span class="hidden md:block w-12 h-px ${done ? "bg-green-700 dark:bg-green-600" : "bg-slate-200 dark:bg-slate-700"} ml-1"></span>` : ""}
+    </li>`;
+  }).join("")}
+  </ol></nav>` : '';
+  
+  return `<header class="bg-white dark:bg-slate-800 border-b border-slate-200 dark:border-slate-700 sticky top-0 z-40 transition-colors">
+    <div class="max-w-6xl mx-auto px-5 py-3 flex items-center justify-between">
+      <div class="flex items-center gap-3"><div class="w-9 h-9 rounded-lg bg-[#0284c7] text-white font-bold flex items-center justify-center">R</div>
+      <div><div class="font-semibold leading-tight text-slate-800 dark:text-white">Rantalainen Hinnantarkastus</div><div class="text-[10px] tracking-wide text-slate-500 dark:text-slate-400 font-semibold uppercase">${S.view === 'admin' ? 'Admin Ylläpito' : 'Myyjän Työkalu'}</div></div></div>
+      <div class="flex items-center">
+        <div class="hidden sm:block text-right mr-4">
+          <div class="text-sm font-semibold leading-tight text-slate-800 dark:text-white">${S.role === 'admin' ? 'Ylläpitäjä' : 'B2B Myyjä'}</div>
+          <button onclick="S.view='login'; S.role=null; render();" class="text-[11px] text-slate-500 dark:text-slate-400 hover:text-red-600 font-medium">Kirjaudu ulos</button>
+        </div>
+        ${adminBtn}
+        ${themeBtn}
+      </div>
+    </div>
+    ${nav}
+  </header>`;
+}
+
+// ADMIN NÄKYMÄ
+function adminView() {
+  return `<div class="max-w-6xl mx-auto space-y-6">
+    <div class="border-b border-slate-200 dark:border-slate-700 pb-4 mb-6 flex justify-between items-center">
+      <div>
+        <h1 class="text-2xl font-bold text-slate-900 dark:text-white">Tuotteiden ja hinnoittelun hallinta</h1>
+        <p class="text-slate-600 dark:text-slate-400 text-sm mt-1">Muokkaa tietomallin hintoja ja tallenna muutokset erillisillä tallennuspainikkeilla.</p>
+      </div>
+    </div>
+    
+    <div class="bg-white dark:bg-slate-800 rounded-xl shadow-sm border border-slate-200 dark:border-slate-700 overflow-hidden">
+      <div class="overflow-x-auto">
+        <table class="w-full text-left text-sm whitespace-nowrap">
+          <thead class="bg-slate-50 dark:bg-slate-900/50 border-b border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300">
+            <tr>
+              <th class="py-3 px-4 font-semibold">Tunniste</th>
+              <th class="py-3 px-4 font-semibold">Tuotteen nimi</th>
+              <th class="py-3 px-4 font-semibold">Kategoria</th>
+              <th class="py-3 px-4 font-semibold text-right">Yksikköhinta (€)</th>
+              <th class="py-3 px-4 font-semibold text-right">Katevaroitusraja (€)</th>
+              <th class="py-3 px-4 font-semibold text-center">Toiminnot</th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100 dark:divide-slate-700/50">
+            ${DATA.products.map(p => `
+              <tr class="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+                <td class="py-3 px-4 font-mono text-xs text-slate-500 dark:text-slate-400">${p.id}</td>
+                <td class="py-3 px-4 font-semibold text-slate-800 dark:text-slate-200">${p.name}</td>
+                <td class="py-3 px-4 text-xs text-slate-600 dark:text-slate-400">
+                  <span class="bg-slate-100 dark:bg-slate-700 px-2 py-1 rounded text-slate-700 dark:text-slate-300">${p.category}</span>
+                </td>
+                <td class="py-3 px-4 text-right">
+                  <input type="number" step="0.01" id="price-${p.id}" value="${p.unitPrice}" class="w-24 border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white rounded p-1.5 text-right text-sm font-medium focus:ring-1 focus:ring-sky-500 outline-none">
+                </td>
+                <td class="py-3 px-4 text-right">
+                  <input type="number" step="0.01" id="min-${p.id}" value="${p.minPrice}" class="w-24 border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white rounded p-1.5 text-right text-sm font-medium focus:ring-1 focus:ring-sky-500 outline-none">
+                </td>
+                <td class="py-3 px-4 text-center">
+                  <button onclick="saveProduct('${p.id}')" class="bg-[#0284c7] hover:bg-sky-700 text-white text-xs font-semibold px-3 py-1.5 rounded transition-colors shadow-sm">
+                    💾 Tallenna
+                  </button>
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>`;
+}
+
+function saveProduct(id) {
+  const p = prod(id);
+  const newPrice = parseFloat(document.getElementById(`price-${id}`).value);
+  const newMin = parseFloat(document.getElementById(`min-${id}`).value);
+
+  if (isNaN(newPrice) || isNaN(newMin)) {
+    showToast('Tarkista syötetyt arvot!');
+    return;
+  }
+
+  p.unitPrice = newPrice;
+  p.minPrice = newMin;
+  
+  showToast(`Tuotteen ${p.name} tiedot tallennettu!`);
+}
+
+// MYYNTINÄKYMÄN KOMPONENTIT
+function summaryBox(final) {
+  const c = calc();
+  const row = (a, b, cls = "") => `<div class="flex justify-between text-sm py-0.5 ${cls}"><span class="text-slate-600 dark:text-slate-400">${a}</span><span class="font-semibold text-slate-900 dark:text-white">${b}</span></div>`;
+  const next = final ? "" : `<button onclick="go(${S.step + 1})" class="w-full mt-4 rounded-md bg-[#0284c7] hover:bg-[#0369a1] text-white py-2.5 text-sm font-semibold transition-colors">Jatka seuraavaan vaiheeseen →</button>
+    ${S.step > 1 ? `<button onclick="go(${S.step - 1})" class="w-full mt-2 rounded-md border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-800 dark:text-slate-200 py-2 text-sm font-semibold hover:bg-slate-50 dark:hover:bg-slate-700 transition-colors">← Edellinen vaihe</button>` : ""}`;
+  
+  return `<aside id="sum" class="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm p-5 h-fit lg:sticky lg:top-24 flex flex-col gap-4 transition-colors">
+    <div>
+        <h3 class="font-semibold text-slate-900 dark:text-white text-base border-b border-slate-100 dark:border-slate-700 pb-2 mb-2">Laskennallinen yhteenveto</h3>
+        ${row("Jatkuvat palvelut yhteensä", eur(c.subtotalMonthly))}
+        ${c.a02_monthly ? row("Sopimusasiakas (-10%)", "−" + eur(c.a02_monthly), "[&_span]:!text-red-700 dark:[&_span]:!text-red-400") : ""}
+        ${c.a01_monthly ? row("Keskittäjäalennus (-5%)", "−" + eur(c.a01_monthly), "[&_span]:!text-red-700 dark:[&_span]:!text-red-400") : ""}
+        <div class="mt-2 pt-2 border-t border-slate-100 dark:border-slate-700 flex items-baseline justify-between gap-2">
+          <span class="font-semibold text-sm text-slate-900 dark:text-white">Suositeltu hinta</span>
+          <span class="text-xl font-bold text-[#0284c7] dark:text-sky-400">${eur(c.recommendedMonthly)} / kk</span>
+        </div>
+    </div>
+    
+    ${c.subtotalOnetime > 0 ? `<div class="border-t border-slate-100 dark:border-slate-700 pt-3">
+        <h3 class="font-semibold text-slate-900 dark:text-white text-sm mb-1">Kertaluonteiset palvelut</h3>
+        ${row("Välisumma", eur(c.subtotalOnetime))}
+        ${c.a02_onetime ? row("Sopimusasiakas (-10%)", "−" + eur(c.a02_onetime), "[&_span]:!text-red-700 dark:[&_span]:!text-red-400") : ""}
+        <div class="flex justify-between text-sm mt-1 text-slate-900 dark:text-white"><b>Kertamaksut yhteensä</b><b>${eur(c.onetime)}</b></div>
+    </div>` : ""}
+
+    ${c.a03 ? `<div class="rounded-md bg-green-50 dark:bg-green-900/20 border border-green-100 dark:border-green-800/50 text-green-800 dark:text-green-400 text-xs px-3 py-2">
+        <div class="flex justify-between font-semibold"><span>Uusi Asiakas -kampanja</span><span>−50,00 €</span></div>
+        <div class="text-[11px] text-green-700 dark:text-green-500 mt-0.5">Vähennetään 1. kuukauden laskulta</div>
+    </div>` : ""}
+
+    ${c.warnings.length > 0 ? `<div class="rounded-md bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 text-amber-900 dark:text-amber-400 text-xs px-3 py-2 space-y-1">
+        <div class="font-bold flex items-center gap-1">⚠️ Huomioita laskelmassa</div>
+        ${c.warnings.map(w => `<div>${w}</div>`).join('')}
+    </div>` : ""}
+    
+    ${next}</aside>`;
+}
+
+function updateSurveyCalculations() {
+  applySurveyToPricing();
+  const c = calc();
+  const pkg = pkgOf(S.pkg);
+
+  const nameEl = document.getElementById("rec-pkg-name");
+  const descEl = document.getElementById("rec-pkg-desc");
+  const priceEl = document.getElementById("rec-pkg-price");
+
+  if (nameEl) nameEl.textContent = pkg.name;
+  if (descEl) descEl.textContent = "Kohdeasiakas: " + pkg.targetCustomer;
+  if (priceEl) priceEl.textContent = eur(c.recommendedMonthly) + " / kk";
+}
+
+// VAIHE 1
+function step1() {
+  const c = calc();
+  return `<div class="max-w-4xl mx-auto space-y-6">
+  <div class="bg-white dark:bg-slate-800 rounded-xl p-6 shadow-sm border border-slate-200 dark:border-slate-700 transition-colors">
+    <div class="border-b border-slate-100 dark:border-slate-700 pb-4 mb-6">
+      <h1 class="text-2xl font-bold text-slate-900 dark:text-white">1. Asiakkaan tiedot ja tarkka tarvekartoitus</h1>
+      <p class="text-slate-600 dark:text-slate-400 text-sm mt-1">Syötä asiakkaan volyymitiedot. Järjestelmä suosittelee oikeaa pakettia ja laskee monimutkaisuuskertoimet.</p>
+    </div>
+
+    <div class="grid md:grid-cols-2 gap-6">
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Tositemäärä (kpl / kk)</label>
+        <input type="number" min="0" value="${S.survey.invoices}" oninput="S.survey.invoices=this.value; updateSurveyCalculations();" class="w-full rounded-md border border-slate-300 dark:border-slate-600 p-2.5 text-sm bg-slate-50 dark:bg-slate-900/50 font-semibold text-slate-800 dark:text-white outline-none focus:border-sky-500">
+        <span class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 block">Yli 100 tositteen määrät lisäävät monimutkaisuuslisää dynaamisesti.</span>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Työntekijämäärä (kpl)</label>
+        <input type="number" min="0" value="${S.survey.employees}" oninput="S.survey.employees=this.value; updateSurveyCalculations();" class="w-full rounded-md border border-slate-300 dark:border-slate-600 p-2.5 text-sm bg-slate-50 dark:bg-slate-900/50 font-semibold text-slate-800 dark:text-white outline-none focus:border-sky-500">
+        <span class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 block">Vaikuttaa palkanlaskennan laskutusmäärään automaattisesti.</span>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Toimipaikkojen / Yhtiöiden määrä</label>
+        <input type="number" min="1" value="${S.survey.locations}" oninput="S.survey.locations=this.value; updateSurveyCalculations();" class="w-full rounded-md border border-slate-300 dark:border-slate-600 p-2.5 text-sm bg-slate-50 dark:bg-slate-900/50 font-semibold text-slate-800 dark:text-white outline-none focus:border-sky-500">
+        <span class="text-[11px] text-slate-500 dark:text-slate-400 mt-1 block">Lisätoimipaikat lisäävät +40 €/kk per toimipaikka.</span>
+      </div>
+
+      <div>
+        <label class="block text-sm font-semibold text-slate-700 dark:text-slate-300 mb-1">Raportointitarve</label>
+        <select onchange="S.survey.reporting=this.value; updateSurveyCalculations();" class="w-full rounded-md border border-slate-300 dark:border-slate-600 p-2.5 text-sm bg-slate-50 dark:bg-slate-900/50 font-semibold text-slate-800 dark:text-white outline-none focus:border-sky-500">
+          <option value="Perus" ${S.survey.reporting === "Perus" ? "selected" : ""}>Perusraportointi</option>
+          <option value="Laaja" ${S.survey.reporting === "Laaja" ? "selected" : ""}>Laajempi johdon raportointi (+30 €/kk)</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="mt-8 p-5 bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/50 rounded-lg">
+      <div class="text-xs uppercase font-bold text-sky-800 dark:text-sky-400 tracking-wider">Kartoituksen perusteella automaattisesti valittu pohja</div>
+      <div class="flex items-center justify-between mt-2">
+        <div>
+          <div id="rec-pkg-name" class="text-xl font-bold text-slate-900 dark:text-white">${pkgOf(S.pkg).name}</div>
+          <div id="rec-pkg-desc" class="text-sm text-slate-600 dark:text-slate-400 mt-0.5">Kohdeasiakas: ${pkgOf(S.pkg).targetCustomer}</div>
+        </div>
+        <div class="text-right">
+          <div id="rec-pkg-price" class="text-2xl font-extrabold text-[#0284c7] dark:text-sky-400">${eur(c.recommendedMonthly)} / kk</div>
+          <div class="text-[11px] text-slate-500 dark:text-slate-400 font-medium">Sisältää ydin- ja volyymilisät</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="mt-6 pt-4 border-t border-slate-100 dark:border-slate-700 text-right">
+      <button onclick="go(2)" class="rounded-md bg-[#0284c7] hover:bg-[#0369a1] text-white px-6 py-2.5 text-sm font-semibold transition-colors">Siirry valitsemaan paketti ja palvelut →</button>
+    </div>
+  </div></div>`;
+}
+
+// VAIHE 2
+function step2() {
+  return `<div class="grid lg:grid-cols-[1fr_340px] gap-6 items-start"><div>
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-white">2. Palvelupaketin valinta ja erittely</h1>
+  <p class="text-slate-600 dark:text-slate-400 text-sm mt-1">Valitse sopivin Core-paketti. Pakettien hinnat lasketaan dynaamisesti moduulien summasta.</p>
+  
+  <div class="space-y-4 mt-6">
+    ${DATA.packages.map(p => {
+      const sel = S.pkg === p.id;
+      const baseCost = pkgBasePrice(p.id);
+      return `<div class="bg-white dark:bg-slate-800 rounded-xl border ${sel ? "border-2 border-[#0284c7] dark:border-sky-500 shadow-md" : "border-slate-200 dark:border-slate-700"} p-5 transition-all">
+        <div class="flex items-start justify-between gap-4 border-b border-slate-100 dark:border-slate-700 pb-3">
+          <div>
+            <div class="flex items-center gap-2">
+              <h2 class="text-lg font-bold text-slate-900 dark:text-white">${p.name}</h2>${sel ? `<span class="bg-sky-100 dark:bg-sky-900/50 text-[#0284c7] dark:text-sky-400 text-[10px] uppercase font-bold px-2 py-0.5 rounded-full">Valittu</span>` : ""}
+            </div>
+            <p class="text-xs text-slate-600 dark:text-slate-400 mt-1">Kohdeasiakas: ${p.targetCustomer}</p>
+          </div>
+          <div class="text-right shrink-0">
+            <div class="text-xl font-bold text-slate-900 dark:text-white">${eur(baseCost)} / kk</div>
+            <button onclick="S.pkg='${p.id}'; render();" class="mt-2 text-xs font-semibold rounded px-3 py-1.5 transition-colors ${sel ? "bg-[#0284c7] text-white" : "border border-slate-300 dark:border-slate-600 text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-700"}">
+              ${sel ? "Aktiivinen paketti" : "Vaihda tähän"}
+            </button>
+          </div>
+        </div>
+
+        <div class="mt-4">
+          <div class="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">Pakettiin sisältyvät ydinmoduulit:</div>
+          <div class="grid sm:grid-cols-2 gap-2">
+            ${p.includedModules.map(mId => {
+              const m = prod(mId);
+              return `<div class="flex items-center justify-between text-xs text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900/50 p-2 rounded border border-slate-100 dark:border-slate-700">
+                <span class="font-medium"><span class="text-[#0284c7] dark:text-sky-400 font-bold mr-1.5">✓</span>${m.name}</span>
+                <span class="font-semibold text-slate-500 dark:text-slate-400">${eur(m.unitPrice)} / kk</span>
+              </div>`;
+            }).join("")}
+          </div>
+        </div>
+      </div>`;
+    }).join("")}
+  </div>
+  </div>${summaryBox()}</div>`;
+}
+
+// VAIHE 3
+function step3() {
+  const c = calc();
+  const extras = DATA.products.filter(p => p.category !== "Core");
+  const pk = pkgOf(S.pkg);
+  
+  const discAmounts = {
+    "A-01": c.a01_monthly,
+    "A-02": c.a02_monthly + c.a02_onetime,
+    "A-03": c.a03
+  };
+
+  const discNotes = {
+    "A-01": "5 % alennus koko jatkuvasta kuukausimaksusta",
+    "A-02": "10 % alennus asiantuntijatöistä (HR-konsultointi, Käyttöönottoprojekti)",
+    "A-03": "50 € kerta-alennus ensimmäisen kuukauden laskusta"
+  };
+
+  return `<div class="grid lg:grid-cols-[1fr_340px] gap-6 items-start"><div>
+  <h1 class="text-2xl font-bold text-slate-900 dark:text-white">3. Erilliset lisäpalvelut ja alennukset</h1>
+  <p class="text-slate-600 dark:text-slate-400 text-sm mt-1">Lisää kiinteän ydinpalvelun päälle täydentäviä palveluita ja alennuksia.</p>
+  
+  <section class="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm p-6 mt-6 transition-colors">
+    <h2 class="font-semibold text-slate-900 dark:text-white text-base mb-4 border-b border-slate-100 dark:border-slate-700 pb-2">Erilliset lisäpalvelut</h2>
+    ${extras.map(p => {
+      const on = !!S.extras[p.id], hasQty = p.billingUnit !== "kk";
+      const q = on ? S.extras[p.id].qty : 1;
+      
+      let missingDep = false;
+      if (p.dependencies && p.dependencies.length > 0) {
+        missingDep = !p.dependencies.some(dep => pk.includedModules.includes(dep));
+      }
+      
+      return `<div class="border ${on ? 'border-[#0284c7] dark:border-sky-500 bg-sky-50/30 dark:bg-sky-900/20' : 'border-slate-200 dark:border-slate-700'} rounded-lg p-4 mb-3 transition-colors">
+        <label class="flex items-start justify-between gap-3 ${missingDep ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}">
+          <span class="flex items-start gap-3">
+            <input type="checkbox" class="mt-1 w-4 h-4 accent-[#0284c7]" ${missingDep ? 'pointer-events-none' : ''} ${on ? "checked" : ""} onchange="toggleExtra('${p.id}')">
+            <span>
+              <span class="block text-sm font-semibold text-slate-900 dark:text-white">${p.name}</span>
+              <span class="block text-xs text-slate-500 dark:text-slate-400">${p.category} • Laskutus: ${p.billingType}</span>
+              ${missingDep ? `<span class="block mt-1 text-[10px] font-bold text-red-600 dark:text-red-400 uppercase">Vaatii moduulin: ${p.dependencies.map(d=>prod(d).name).join(' tai ')}</span>` : ''}
+            </span>
+          </span>
+          <span class="text-sm font-bold text-slate-800 dark:text-slate-200">${eur(p.unitPrice)} <span class="font-normal text-slate-500 dark:text-slate-400">/ ${p.billingUnit}</span></span>
+        </label>
+        
+        ${on && hasQty ? `<div class="mt-3 ml-7 flex items-center gap-4 bg-white dark:bg-slate-900/50 p-2 rounded-md border border-sky-100 dark:border-slate-700 shadow-sm">
+          <label class="text-xs font-semibold text-slate-700 dark:text-slate-300">Määrä (${p.billingUnit}): 
+          <input type="number" min="1" value="${q}" oninput="setQty('${p.id}',this.value)" class="ml-2 w-20 rounded border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-800 text-slate-900 dark:text-white p-1.5 text-sm font-normal outline-none focus:border-sky-500"></label>
+          <span class="text-xs text-slate-700 dark:text-slate-300">Yhteensä: <b class="text-[#0284c7] dark:text-sky-400 text-sm">${eur(p.unitPrice * q)}</b></span>
+        </div>` : ""}
+      </div>`;
+    }).join("")}
+  </section>
+
+  <section class="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm p-6 mt-5 transition-colors">
+    <h2 class="font-semibold text-slate-900 dark:text-white text-base mb-4 border-b border-slate-100 dark:border-slate-700 pb-2">Sovellettavat alennukset ja kampanjat</h2>
+    ${DATA.discounts.map(d => {
+      const on = !!S.disc[d.id];
+      const amt = discAmounts[d.id] || 0;
+      const noEffect = on && d.id === "A-02" && amt === 0;
+      return `<label class="flex items-center justify-between bg-slate-50 dark:bg-slate-900/50 rounded-lg p-4 mb-3 cursor-pointer border ${on ? 'border-sky-200 dark:border-sky-700/50 bg-sky-50/50 dark:bg-sky-900/30' : 'border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700/50'} transition-colors">
+        <span class="flex items-center gap-3">
+          <input type="checkbox" class="w-4 h-4 accent-[#0284c7]" ${on ? "checked" : ""} onchange="S.disc['${d.id}'] = !S.disc['${d.id}']; render();">
+          <span>
+            <span class="block text-sm font-semibold text-slate-900 dark:text-white">${d.name}</span>
+            <span class="block text-xs text-slate-500 dark:text-slate-400">${discNotes[d.id]}</span>
+            ${noEffect ? '<span class="block text-xs text-amber-700 dark:text-amber-400 mt-1 font-medium bg-amber-100 dark:bg-amber-900/30 inline-block px-2 py-0.5 rounded">Ei vaikutusta nykyiseen koriin.</span>' : ""}
+          </span>
+        </span>
+        <span class="text-sm font-bold ${on && amt > 0 ? "text-green-700 dark:text-green-400" : "text-slate-400 dark:text-slate-500"}">${on && amt > 0 ? "−" + eur(amt) : "−" + (d.calculationType === "percentage" ? d.value + " %" : eur(d.value))}</span>
+      </label>`;
+    }).join("")}
+  </section>
+  </div>${summaryBox()}</div>`;
+}
+
+// VAIHE 4
+function step4() {
+  const c = calc();
+  return `<div class="max-w-4xl mx-auto space-y-6">
+  <section class="bg-white dark:bg-slate-800 rounded-xl border border-slate-200 dark:border-slate-700 shadow-sm p-6 transition-colors">
+    <h1 class="text-2xl font-bold text-slate-900 dark:text-white border-b border-slate-100 dark:border-slate-700 pb-4">4. Hinnan yhteenveto ja suositeltu sopimushinta</h1>
+    
+    <div class="mt-6 overflow-x-auto rounded-lg border border-slate-200 dark:border-slate-700">
+      <table class="w-full text-sm text-left">
+        <thead class="bg-slate-50 dark:bg-slate-900/50 text-slate-700 dark:text-slate-300 border-b border-slate-200 dark:border-slate-700">
+          <tr>
+            <th class="py-3 px-4 font-semibold">Palvelukomponentti</th>
+            <th class="py-3 px-4 font-semibold">Kategoria</th>
+            <th class="py-3 px-4 font-semibold text-right">Listahinta</th>
+            <th class="py-3 px-4 font-semibold text-right">Alennus</th>
+            <th class="py-3 px-4 font-semibold text-right">Nettohinta</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-slate-100 dark:divide-slate-700">
+          ${c.lines.map(l => {
+            const discVal = l.disc || 0;
+            return `<tr class="hover:bg-slate-50 dark:hover:bg-slate-700/30 transition-colors">
+              <td class="py-3 px-4 font-semibold text-slate-900 dark:text-white">${l.label}</td>
+              <td class="py-3 px-4 text-xs text-slate-500 dark:text-slate-400">${l.cat}</td>
+              <td class="py-3 px-4 text-right text-slate-600 dark:text-slate-300">${eur(l.list)}</td>
+              <td class="py-3 px-4 text-right ${discVal > 0 ? "text-green-700 dark:text-green-400 font-medium" : "text-slate-400 dark:text-slate-500"}">${discVal > 0 ? "−" + eur(discVal) : "—"}</td>
+              <td class="py-3 px-4 text-right font-bold text-slate-900 dark:text-white">${eur(l.list - discVal)}</td>
+            </tr>`;
+          }).join("")}
+        </tbody>
+        <tfoot class="border-t border-slate-200 dark:border-slate-700 divide-y divide-slate-100 dark:divide-slate-700">
+          <tr>
+            <td colspan="4" class="py-3 px-4 font-semibold text-slate-900 dark:text-white">Kuukausirivit yhteensä</td>
+            <td class="py-3 px-4 text-right font-bold text-slate-900 dark:text-white">${eur(c.subtotalMonthly - c.a02_monthly)}</td>
+          </tr>
+          ${c.a01_monthly > 0 ? `<tr>
+            <td colspan="4" class="py-3 px-4 font-semibold text-slate-900 dark:text-white">Keskittäjäalennus (-5 %)</td>
+            <td class="py-3 px-4 text-right text-green-700 dark:text-green-400 font-medium">−${eur(c.a01_monthly)}</td>
+          </tr>` : ""}
+          <tr>
+            <td colspan="4" class="py-3 px-4 font-semibold text-slate-900 dark:text-white">Suositeltu kuukausihinta</td>
+            <td class="py-3 px-4 text-right font-bold text-[#0284c7] dark:text-sky-400">${eur(c.recommendedMonthly)}</td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <!-- Alennusten erittely osio -->
+    <div class="mt-6 p-5 bg-slate-50 dark:bg-slate-900/50 rounded-lg border border-slate-200 dark:border-slate-700">
+      <h3 class="text-[11px] uppercase font-bold text-slate-500 dark:text-slate-400 tracking-wider mb-3">Sovelletut alennukset eriteltynä</h3>
+      <div class="space-y-2 text-sm">
+        ${c.a02_monthly + c.a02_onetime > 0 ? `<div class="flex justify-between text-green-700 dark:text-green-400"><span>Sopimusasiakasalennus (-10 % asiantuntijatöistä)</span><b>−${eur(c.a02_monthly + c.a02_onetime)}</b></div>` : ""}
+        ${c.a01_monthly > 0 ? `<div class="flex justify-between text-green-700 dark:text-green-400"><span>Keskittäjäalennus (-5 % kuukausimaksusta)</span><b>−${eur(c.a01_monthly)} / kk</b></div>` : ""}
+        ${c.a03 > 0 ? `<div class="flex justify-between text-green-700 dark:text-green-400"><span>Kampanja: Uusi Asiakas</span><b>−${eur(c.a03)} (1. kuukauden laskusta)</b></div>` : ""}
+        ${!(c.a02_monthly + c.a02_onetime > 0 || c.a01_monthly > 0 || c.a03 > 0) ? `<div class="text-xs text-slate-500 dark:text-slate-400 italic">Ei valittuja alennuksia.</div>` : ""}
+      </div>
+    </div>
+
+    <div class="mt-6 p-6 rounded-xl bg-sky-50 dark:bg-sky-900/20 border border-sky-200 dark:border-sky-800/50 flex flex-wrap items-center justify-between gap-6">
+      <div>
+        <div class="text-xs uppercase font-bold text-sky-800 dark:text-sky-400 tracking-wider">Laskennallinen suositushinta</div>
+        <div class="text-4xl font-extrabold text-[#0284c7] dark:text-sky-400 mt-1">${eur(c.recommendedMonthly)} <span class="text-base font-medium text-slate-600 dark:text-slate-400">/ kk</span></div>
+        ${c.onetime > 0 ? `<div class="text-sm text-slate-600 dark:text-slate-300 mt-2 font-medium">+ Kertamaksut yhteensä: <b class="text-slate-800 dark:text-white">${eur(c.onetime)}</b></div>` : ""}
+      </div>
+
+      <div class="bg-white dark:bg-slate-800 p-4 rounded-xl border border-sky-200 dark:border-slate-600 shadow-sm">
+        <label class="block text-xs font-bold text-slate-700 dark:text-slate-300 mb-2 uppercase tracking-wide">Syötä poikkeava sopimushinta (€/kk)</label>
+        <div class="flex items-center gap-3">
+          <input type="number" value="${S.customPrice !== null ? S.customPrice : ""}" placeholder="${c.recommendedMonthly}" oninput="S.customPrice = this.value ? parseFloat(this.value) : null;" onchange="render()" class="w-32 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 text-slate-900 dark:text-white p-2 text-base font-semibold outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500 text-right">
+          ${S.customPrice !== null ? `<button onclick="S.customPrice=null; render();" class="text-xs font-semibold text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300 underline bg-red-50 dark:bg-red-900/30 px-2 py-1 rounded">Palauta</button>` : ""}
+        </div>
+      </div>
+    </div>
+
+    ${c.warnings.length > 0 ? `<div class="mt-6 p-4 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800/50 rounded-lg text-amber-900 dark:text-amber-400 text-sm font-medium flex gap-3">
+      <span class="text-xl">⚠️</span>
+      <div class="space-y-1 mt-0.5">
+        ${c.warnings.map(w => `<div>${w}</div>`).join('')}
+      </div>
+    </div>` : ""}
+  </section>
+  </div>`;
+}
+
+// LOGIIKKA JA RENDERÖINTI
+function render() {
+  const app = document.getElementById("app");
+  if (S.view === 'login') {
+    app.innerHTML = loginView();
+  } else if (S.view === 'admin') {
+    app.innerHTML = header() + `<main class="max-w-6xl mx-auto px-5 py-8">${adminView()}</main>`;
+  } else {
+    app.innerHTML = header() + `<main class="max-w-6xl mx-auto px-5 py-8">${[step1, step2, step3, step4][S.step - 1]()}</main>`;
+  }
+}
+
+function updateSum() {
+  const old = document.getElementById("sum");
+  if (old) old.outerHTML = summaryBox();
+  
+  if (S.step === 4) render();
+}
+
+function go(n) { S.step = n; render(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+
+function toggleExtra(id) {
+  const p = prod(id);
+  
+  if (p.dependencies && p.dependencies.length > 0 && !S.extras[id]) {
+    const pk = pkgOf(S.pkg);
+    const hasDep = p.dependencies.some(dep => pk.includedModules.includes(dep));
+    if (!hasDep) {
+      const depNames = p.dependencies.map(d => prod(d).name).join(' tai ');
+      showToast(`Valinta estetty: ${p.name} vaatii pohjalle moduulin: ${depNames}`);
+      event.target.checked = false; 
+      return; 
+    }
+  }
+
+  if (S.extras[id]) delete S.extras[id];
+  else S.extras[id] = { qty: 1 };
+  render();
+}
+
+function setQty(id, v) {
+  S.extras[id].qty = Math.max(1, parseFloat(v) || 1);
+  updateSum();
+}
+
+// Käynnistä sovellus
+applySurveyToPricing();
+render();
+</script>
+</body>
+</html>
